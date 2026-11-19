@@ -1,0 +1,214 @@
+openapi: 3.1.0
+info:
+  title: RuChronos Manager Control Plane BFF (implemented scope)
+  version: 0.1.0
+  description: Focused contract for Health, Auth, Me and push-device registration.
+servers:
+  - url: http://localhost:8080/api/v1
+security:
+  - bearerAuth: []
+paths:
+  /health:
+    get:
+      security: []
+      responses:
+        '200':
+          description: Service health
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Health'}
+  /auth/config:
+    get:
+      security: []
+      responses:
+        '200':
+          description: Authentication configuration
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AuthConfig'}
+  /auth/login:
+    post:
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/LoginRequest'}
+      responses:
+        '200':
+          description: Login succeeded
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TokenPair'}
+        '401': {$ref: '#/components/responses/ProblemResponse'}
+        '404': {$ref: '#/components/responses/ProblemResponse'}
+  /auth/refresh:
+    post:
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RefreshRequest'}
+      responses:
+        '200':
+          description: Rotated token pair
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TokenPair'}
+        '401': {$ref: '#/components/responses/ProblemResponse'}
+  /auth/logout:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RefreshRequest'}
+      responses:
+        '204': {description: Session revoked}
+        '401': {$ref: '#/components/responses/ProblemResponse'}
+  /me:
+    get:
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/User'}
+        '401': {$ref: '#/components/responses/ProblemResponse'}
+  /me/devices:
+    get:
+      responses:
+        '200':
+          description: User devices
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/Device'}}
+        '401': {$ref: '#/components/responses/ProblemResponse'}
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DeviceRegistration'}
+      responses:
+        '201':
+          description: Device registered
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Device'}
+        '200':
+          description: Existing push token updated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Device'}
+        '400': {$ref: '#/components/responses/ProblemResponse'}
+        '401': {$ref: '#/components/responses/ProblemResponse'}
+  /me/devices/{deviceId}:
+    delete:
+      parameters:
+        - name: deviceId
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '204': {description: Device deleted}
+        '401': {$ref: '#/components/responses/ProblemResponse'}
+        '404': {$ref: '#/components/responses/ProblemResponse'}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  responses:
+    ProblemResponse:
+      description: RFC 9457 error
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: {type: string, format: uri}
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        instance: {type: string}
+        code: {type: string}
+    Health:
+      type: object
+      required: [status, version, uptimeSeconds, databaseConnected, k8sConnected]
+      properties:
+        status: {type: string, enum: [UP, DEGRADED, DOWN]}
+        version: {type: string}
+        uptimeSeconds: {type: integer, format: int64}
+        databaseConnected: {type: boolean}
+        k8sConnected: {type: boolean}
+    AuthConfig:
+      type: object
+      required: [mode, issuerUrl, clientId, oidc]
+      properties:
+        mode: {type: string, enum: [mock, oidc]}
+        issuerUrl: {type: [string, 'null'], format: uri}
+        clientId: {type: [string, 'null']}
+        oidc:
+          oneOf:
+            - type: 'null'
+            - type: object
+              required: [issuer, clientId, scopes]
+              properties:
+                issuer: {type: string, format: uri}
+                clientId: {type: string}
+                scopes: {type: array, items: {type: string}}
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: {type: string}
+        password: {type: string, format: password}
+        role: {type: string, enum: [viewer, operator, admin]}
+    RefreshRequest:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken: {type: string}
+    TokenPair:
+      type: object
+      required: [accessToken, refreshToken, tokenType, expiresIn, user]
+      properties:
+        accessToken: {type: string}
+        refreshToken: {type: string}
+        tokenType: {type: string, const: Bearer}
+        expiresIn: {type: integer}
+        user: {$ref: '#/components/schemas/User'}
+    User:
+      type: object
+      required: [id, username, displayName, email, roles]
+      properties:
+        id: {type: string}
+        username: {type: string}
+        displayName: {type: string}
+        email: {type: string, format: email}
+        roles: {type: array, items: {type: string, enum: [viewer, operator, admin]}}
+    DeviceRegistration:
+      type: object
+      required: [provider, pushToken, platform]
+      properties:
+        provider: {type: string, enum: [apns, fcm, rustore]}
+        pushToken: {type: string}
+        platform: {type: string, enum: [android, ios, web]}
+        deviceName: {type: string}
+    Device:
+      allOf:
+        - $ref: '#/components/schemas/DeviceRegistration'
+        - type: object
+          required: [id, deviceId, createdAt, registeredAt, lastSeenAt]
+          properties:
+            id: {type: string, format: uuid}
+            deviceId: {type: string, format: uuid}
+            createdAt: {type: string, format: date-time}
+            registeredAt: {type: string, format: date-time}
+            lastSeenAt: {type: string, format: date-time}

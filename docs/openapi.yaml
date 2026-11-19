@@ -1,0 +1,2781 @@
+openapi: 3.1.0
+
+info:
+  title: RuChronos Manager API
+  version: 0.1.0
+  summary: Control Plane API (Spring Boot BFF) для мобильного приложения RuChronos Manager.
+  description: |
+    API бэкенда **RuChronos Manager** — контура управления (Control Plane) над кластером
+    PostgreSQL с расширением RuChronos Core. Требования к API идут от мобильного приложения
+    (Flutter): каждый раздел ниже соответствует экрану приложения.
+
+    | Экран приложения | Что даёт API | Теги |
+    | --- | --- | --- |
+    | Загрузка и вход | Вход (пока заглушка), профиль, регистрация устройства для пушей | `Auth`, `Me` |
+    | 1. Кластер | Топология мастер → реплики, CPU / RAM / диск, метрики ядра | `Cluster` |
+    | 2. Таблицы и графики | Поиск таблиц с подсказками, схема таблицы, список доступных графиков | `Tables` |
+    | 3. Быстрые команды | Каталог безопасных команд, запуск, статус и результат | `Quick actions` |
+    | 4. Пороги и алерты | Конструктор порогов, каналы уведомлений, журнал инцидентов | `Thresholds`, `Notification channels`, `Incidents` |
+    | Живые данные | **Графики и обновления идут только по WebSocket** — см. `GET /ws` | `Realtime` |
+
+    ## Общие соглашения
+
+    - **Базовый путь** — `/api/v1`. Все тела запросов и ответов в JSON (`application/json`).
+    - **Время** в REST — строки RFC 3339 в UTC (`2026-10-23T09:15:00Z`). В WebSocket-сообщениях
+      время точек графика — миллисекунды Unix epoch (компактнее для потока).
+    - **Авторизация** — заголовок `Authorization: Bearer <accessToken>`. Сейчас токен выдаёт
+      заглушка `POST /auth/login`. В проде токен будет выдавать система входа клиента
+      (у каждого заказчика своя: Keycloak, AD/LDAP и т. п.), бэкенд только проверяет его.
+    - **Роли (RBAC):** `viewer` — только чтение; `operator` — плюс быстрые команды, подтверждение
+      и закрытие инцидентов; `admin` — плюс пороги, каналы уведомлений и команды с подтверждением.
+      Требуемая роль указана в описании каждой операции.
+    - **Ошибки** — формат `application/problem+json` (RFC 9457), поле `code` — машиночитаемый код.
+    - **Пагинация списков** — курсорная: `?limit=&cursor=`, в ответе `nextCursor` (`null` — конец).
+    - **Идентификатор таблицы** (`tableId`) — полное имя `schema.table`, например `public.k8s_nodes`.
+      В пути его нужно URL-кодировать как обычную строку.
+    - **Ключи метрик узла** (`cpuUsagePercent`, `ramUsagePercent`, …) совпадают с именами полей
+      в объекте `NodeMetrics`, чтобы клиент мог брать значение как `metrics[key]`.
+
+    ## Чего в API нет намеренно
+
+    - Произвольного SQL. Быстрые команды — только из белого списка на сервере;
+      `DROP TABLE`, `DROP DATABASE` и другие разрушающие операции не реализуются вообще.
+    - Записи телеметрии. Данные пишутся напрямую в PostgreSQL (Data Plane), Java-сервис их только читает.
+    - Порт PostgreSQL 5432 наружу не открывается: мобильное приложение ходит только в этот API.
+  contact:
+    name: Команда RuChronos (pg_t10s)
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://{host}/api/v1
+    description: Инсталляция RuChronos Manager у клиента
+    variables:
+      host:
+        default: manager.example.local
+  - url: http://localhost:8080/api/v1
+    description: Локальная разработка
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Auth
+    description: Вход в приложение. Пока заглушка (mock), см. описание `POST /auth/login`.
+  - name: Me
+    description: Текущий пользователь и его устройства для пуш-уведомлений.
+  - name: Cluster
+    description: Экран 1 — топология кластера и здоровье узлов (снимок; живые обновления — по WebSocket).
+  - name: Tables
+    description: Экран 2 — обозреватель таблиц. Данные графиков приходят по WebSocket.
+  - name: Quick actions
+    description: Экран 3 — быстрые команды к кластеру (белый список безопасных операций).
+  - name: Thresholds
+    description: Экран 4 — пороги (thresholds) на метрики узлов, таблиц и колонок.
+  - name: Notification channels
+    description: Экран 4 — куда слать алерты (пуш, почта, Telegram). Отправку делает бэкенд, не приложение.
+  - name: Incidents
+    description: Экран 4 — журнал инцидентов (сработавших порогов).
+  - name: Realtime
+    description: WebSocket-канал для графиков, обновлений кластера, инцидентов и статусов команд.
+  - name: System
+    description: Служебные ручки.
+
+paths:
+
+  # ---------------------------------------------------------------- System
+
+  /health:
+    get:
+      tags: [System]
+      operationId: getHealth
+      summary: Проверка живости сервиса
+      description: Не требует авторизации. Используется балансировщиком и экраном загрузки приложения.
+      security: []
+      responses:
+        '200':
+          description: Сервис работает
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              example:
+                status: up
+                version: 0.1.0
+                database: up
+
+  # ---------------------------------------------------------------- Auth
+
+  /auth/config:
+    get:
+      tags: [Auth]
+      operationId: getAuthConfig
+      summary: Как в этой инсталляции устроен вход
+      description: |
+        Приложение вызывает при запуске, чтобы решить, какой экран входа показать:
+        форму логина (режим `mock`) или переход на страницу входа клиента (режим `oidc`).
+        Не требует авторизации.
+      security: []
+      responses:
+        '200':
+          description: Конфигурация входа
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthConfig'
+              examples:
+                mock:
+                  summary: Заглушка (текущий этап)
+                  value:
+                    mode: mock
+                    oidc: null
+                oidc:
+                  summary: Вход через систему клиента
+                  value:
+                    mode: oidc
+                    oidc:
+                      issuer: https://sso.client.local/realms/main
+                      clientId: ruchronos-mobile
+                      scopes: [openid, profile, email]
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Вход по логину и паролю (заглушка)
+      description: |
+        **Mock.** Свою систему аутентификации не делаем: у каждого клиента она уже есть,
+        и он подключит её сам (режим `oidc`). На этом этапе ручка принимает тестовых
+        пользователей из конфигурации бэкенда (например, `admin/admin`, `operator/operator`,
+        `viewer/viewer`) и выдаёт JWT. В режиме `oidc` возвращает `404`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              username: admin
+              password: admin
+      responses:
+        '200':
+          description: Успешный вход
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Вход по паролю выключен (режим `oidc`)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshToken
+      summary: Обновить access-токен
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: Новая пара токенов (refresh-токен ротируется)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Выйти
+      description: Отзывает refresh-токен. Устройство для пушей стоит удалить отдельно (`DELETE /me/devices/{deviceId}`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '204':
+          description: Выход выполнен
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ---------------------------------------------------------------- Me
+
+  /me:
+    get:
+      tags: [Me]
+      operationId: getMe
+      summary: Текущий пользователь
+      description: Роли определяют, какие кнопки показывать в приложении. Роль — любая.
+      responses:
+        '200':
+          description: Профиль
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /me/devices:
+    get:
+      tags: [Me]
+      operationId: listMyDevices
+      summary: Мои устройства для пуш-уведомлений
+      responses:
+        '200':
+          description: Список устройств
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Device'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Me]
+      operationId: registerDevice
+      summary: Зарегистрировать устройство для пушей
+      description: |
+        Приложение вызывает после входа и при каждом обновлении push-токена.
+        Повторная регистрация того же `pushToken` обновляет запись, а не создаёт новую.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceRegistration'
+            example:
+              provider: fcm
+              pushToken: dGhpcyBpcyBhIGZha2UgdG9rZW4
+              platform: android
+              deviceName: Pixel 8
+      responses:
+        '200':
+          description: Устройство уже было, запись обновлена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Device'
+        '201':
+          description: Устройство зарегистрировано
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Device'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /me/devices/{deviceId}:
+    delete:
+      tags: [Me]
+      operationId: deleteDevice
+      summary: Отвязать устройство
+      parameters:
+        - $ref: '#/components/parameters/DeviceId'
+      responses:
+        '204':
+          description: Устройство отвязано, пуши на него больше не приходят
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ---------------------------------------------------------------- Cluster
+
+  /cluster:
+    get:
+      tags: [Cluster]
+      operationId: getCluster
+      summary: Топология и состояние кластера (главный экран)
+      description: |
+        Снимок для первой отрисовки главного экрана: мастер (primary), его нагрузка,
+        затем реплики и их нагрузка. Дальше экран обновляется по WebSocket
+        (канал `cluster`, сообщения `cluster.update`), повторно опрашивать эту ручку не нужно.
+        Роль — любая.
+      responses:
+        '200':
+          description: Состояние кластера
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterOverview'
+              example:
+                name: prod-metrics
+                status: healthy
+                updatedAt: '2026-10-23T09:15:00Z'
+                primary:
+                  id: node-1
+                  role: primary
+                  host: pg-master-1.local
+                  port: 5432
+                  status: online
+                  postgresVersion: '17.2'
+                  ruchronosVersion: 0.3.0
+                  metrics:
+                    cpuUsagePercent: 63.5
+                    ramUsagePercent: 71.2
+                    ramUsedBytes: 24461180928
+                    ramTotalBytes: 34359738368
+                    diskUsagePercent: 48.0
+                    diskUsedBytes: 494780232499
+                    diskTotalBytes: 1030792151040
+                    temperatureCelsius: null
+                    ingestionRate: 182000
+                    compressionRatio: 7.8
+                    walWriteBytesPerSec: 15728640
+                    replicationLagMs: null
+                  replication: null
+                replicas:
+                  - id: node-2
+                    role: replica
+                    host: pg-replica-1.local
+                    port: 5432
+                    status: online
+                    postgresVersion: '17.2'
+                    ruchronosVersion: 0.3.0
+                    metrics:
+                      cpuUsagePercent: 22.1
+                      ramUsagePercent: 55.0
+                      ramUsedBytes: 18897856102
+                      ramTotalBytes: 34359738368
+                      diskUsagePercent: 47.6
+                      diskUsedBytes: 490657095270
+                      diskTotalBytes: 1030792151040
+                      temperatureCelsius: null
+                      ingestionRate: 0
+                      compressionRatio: 7.8
+                      walWriteBytesPerSec: 0
+                      replicationLagMs: 12
+                    replication:
+                      state: streaming
+                      lagMs: 12
+                      lagBytes: 65536
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/ClusterUnavailable'
+
+  /cluster/nodes/{nodeId}:
+    get:
+      tags: [Cluster]
+      operationId: getNode
+      summary: Состояние одного узла
+      description: Для экрана подробностей узла (по нажатию на мастер или реплику). Роль — любая.
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      responses:
+        '200':
+          description: Состояние узла
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeState'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /cluster/metrics:
+    get:
+      tags: [Cluster]
+      operationId: listNodeMetrics
+      summary: Справочник метрик узла
+      description: |
+        Какие метрики узла есть, их единицы и диапазон. Нужен для подписей на главном экране
+        и для конструктора порогов (выпадающий список «метрика»). Роль — любая.
+      responses:
+        '200':
+          description: Справочник
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MetricDescriptor'
+              example:
+                - key: cpuUsagePercent
+                  title: Загрузка CPU
+                  unit: percent
+                  min: 0
+                  max: 100
+                  supported: true
+                - key: temperatureCelsius
+                  title: Температура CPU
+                  unit: celsius
+                  min: null
+                  max: null
+                  supported: false
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ---------------------------------------------------------------- Tables
+
+  /tables:
+    get:
+      tags: [Tables]
+      operationId: searchTables
+      summary: Поиск таблиц (строка поиска с подсказками)
+      description: |
+        Ручка под поисковую строку: при каждом вводе приложение запрашивает подсказки
+        (рекомендуется debounce ~300 мс). Пустой `q` — все таблицы по алфавиту.
+        Поиск по подстроке в `schema.table`, без учёта регистра. Роль — любая.
+      parameters:
+        - name: q
+          in: query
+          description: Подстрока имени таблицы
+          schema:
+            type: string
+            maxLength: 128
+          example: k8s
+        - name: accessMethod
+          in: query
+          description: Фильтр по движку хранения. Без параметра — все таблицы.
+          schema:
+            $ref: '#/components/schemas/AccessMethod'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Найденные таблицы
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableSummaryPage'
+              example:
+                items:
+                  - id: public.k8s_nodes
+                    schema: public
+                    name: k8s_nodes
+                    accessMethod: ruchronos_tam
+                    rowCountEstimate: 418000000
+                    sizeBytes: 21474836480
+                    compressionRatio: 8.1
+                  - id: public.k8s_pods_events
+                    schema: public
+                    name: k8s_pods_events
+                    accessMethod: ruchronos_tam
+                    rowCountEstimate: 92000000
+                    sizeBytes: 6442450944
+                    compressionRatio: 5.4
+                nextCursor: null
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /tables/{tableId}:
+    get:
+      tags: [Tables]
+      operationId: getTable
+      summary: Схема таблицы и доступные графики
+      description: |
+        Приложение вызывает после выбора таблицы в поиске. Возвращает колонки и список
+        графиков, которые можно построить для этой таблицы (`charts`). Данные графиков
+        приходят по WebSocket: подписка `chart` с `tableId` и `chartId` из этого списка.
+
+        **Какие графики доступны** (зависит от сигнатуры таблицы):
+        - `ingestion_rate` — **есть всегда**, для любой таблицы: сколько строк вставлено
+          за интервал (строк/с). Это универсальный график, даже если таблица вида
+          «timestamp + текст» и как рисовать её значения непонятно.
+        - `column:<имя>` — для каждой числовой колонки, если в таблице есть колонка времени
+          (`timestamp`/`timestamptz`): обычный график значения во времени с агрегацией.
+        - Колонки других типов (текст, json и т. п.) графиков не дают.
+        Роль — любая.
+      parameters:
+        - $ref: '#/components/parameters/TableId'
+      responses:
+        '200':
+          description: Детали таблицы
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableDetails'
+              example:
+                id: public.k8s_nodes
+                schema: public
+                name: k8s_nodes
+                accessMethod: ruchronos_tam
+                rowCountEstimate: 418000000
+                sizeBytes: 21474836480
+                compressionRatio: 8.1
+                timeColumn: ts
+                columns:
+                  - name: ts
+                    dataType: timestamptz
+                    nullable: false
+                    kind: time
+                  - name: node_name
+                    dataType: text
+                    nullable: false
+                    kind: text
+                  - name: memory_utilization
+                    dataType: double precision
+                    nullable: true
+                    kind: numeric
+                charts:
+                  - id: ingestion_rate
+                    type: ingestion_rate
+                    title: Скорость вставки
+                    unit: rows_per_sec
+                    column: null
+                    aggregations: [sum]
+                    defaultAggregation: sum
+                  - id: column:memory_utilization
+                    type: column
+                    title: memory_utilization
+                    unit: null
+                    column: memory_utilization
+                    aggregations: [avg, min, max, last]
+                    defaultAggregation: avg
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ---------------------------------------------------------------- Quick actions
+
+  /actions:
+    get:
+      tags: [Quick actions]
+      operationId: listActions
+      summary: Каталог быстрых команд
+      description: |
+        Список кнопок для экрана быстрых команд. Каталог задаётся на сервере (белый список):
+        каждая команда — заранее написанный SQL или вызов функции ядра RuChronos.
+        Разрушающих команд (`DROP TABLE`, `DROP DATABASE`, `TRUNCATE` и т. п.) в каталоге нет и не будет.
+        Роль — любая (запуск — см. `POST /actions/{actionId}/runs`).
+      responses:
+        '200':
+          description: Каталог
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/QuickAction'
+              example:
+                - id: collect_diagnostics
+                  title: Диагностика кластера
+                  description: Снимок pg_stat_activity, pg_stat_database и блокировок.
+                  category: diagnostics
+                  target: cluster
+                  params: []
+                  requiresConfirmation: false
+                  minRole: operator
+                - id: force_compaction
+                  title: Принудительное сжатие чанков
+                  description: Сжимает активные чанки выбранной таблицы RuChronos.
+                  category: maintenance
+                  target: table
+                  params:
+                    - name: olderThanMinutes
+                      type: integer
+                      required: false
+                      default: 60
+                      description: Сжимать только чанки старше N минут
+                  requiresConfirmation: true
+                  minRole: admin
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /actions/{actionId}/runs:
+    post:
+      tags: [Quick actions]
+      operationId: runAction
+      summary: Запустить быструю команду
+      description: |
+        Запуск асинхронный: сразу возвращается `202` с запуском в статусе `queued`.
+        Ход выполнения — по WebSocket (канал `action_runs`) или опросом `GET /action-runs/{runId}`.
+
+        Для команд с `requiresConfirmation: true` приложение должно показать диалог
+        подтверждения и передать `confirm: true`, иначе сервер вернёт `409`.
+        Чтобы двойное нажатие не запустило команду дважды, передавайте `Idempotency-Key`.
+        Роль — не ниже `minRole` команды. Каждый запуск пишется в аудит.
+      parameters:
+        - $ref: '#/components/parameters/ActionId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ActionRunRequest'
+            example:
+              target:
+                tableId: public.k8s_nodes
+              params:
+                olderThanMinutes: 120
+              confirm: true
+      responses:
+        '202':
+          description: Команда поставлена в очередь
+          headers:
+            Location:
+              description: Адрес запуска, `/api/v1/action-runs/{runId}`
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionRun'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 'Нужно подтверждение (`confirm: true`) или такая же команда по этой цели уже выполняется'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /action-runs:
+    get:
+      tags: [Quick actions]
+      operationId: listActionRuns
+      summary: История запусков команд
+      description: Журнал запусков, новые сверху. Он же журнал аудита действий DBA. Роль — любая.
+      parameters:
+        - name: actionId
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/ActionRunStatus'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Запуски
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionRunPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /action-runs/{runId}:
+    get:
+      tags: [Quick actions]
+      operationId: getActionRun
+      summary: Статус и результат запуска
+      description: Роль — любая.
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      responses:
+        '200':
+          description: Запуск
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionRun'
+              example:
+                id: 7b0f3c1e-5d2a-4f61-9a3e-1c2d3e4f5a6b
+                actionId: collect_diagnostics
+                status: succeeded
+                target: {}
+                params: {}
+                startedBy: operator
+                createdAt: '2026-10-23T09:20:00Z'
+                startedAt: '2026-10-23T09:20:01Z'
+                finishedAt: '2026-10-23T09:20:02Z'
+                result:
+                  summary: 'Активных соединений: 42, блокировок: 0'
+                  table:
+                    columns: [state, count]
+                    rows:
+                      - [active, 12]
+                      - [idle, 30]
+                error: null
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ---------------------------------------------------------------- Thresholds
+
+  /thresholds:
+    get:
+      tags: [Thresholds]
+      operationId: listThresholds
+      summary: Список порогов
+      description: |
+        Фильтр `tableId` нужен экрану графиков: чтобы нарисовать линии порогов поверх графика таблицы
+        (то же приходит и в `chart.snapshot` по WebSocket). Роль — любая.
+      parameters:
+        - name: targetKind
+          in: query
+          schema:
+            $ref: '#/components/schemas/ThresholdTargetKind'
+        - name: tableId
+          in: query
+          description: Пороги на эту таблицу и её колонки
+          schema:
+            type: string
+        - name: nodeId
+          in: query
+          description: Пороги на этот узел (включая пороги «на все узлы»)
+          schema:
+            type: string
+        - name: enabled
+          in: query
+          schema:
+            type: boolean
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Пороги
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ThresholdPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Thresholds]
+      operationId: createThreshold
+      summary: Создать порог
+      description: |
+        Порог вешается на одну из трёх целей:
+        - **метрику узла** — например, CPU мастера больше 99%;
+        - **метрику таблицы** — например, в таблице больше 100 млн строк;
+        - **колонку таблицы** — например, `k8s_nodes.memory_utilization` больше 92 (среднее за 1 минуту).
+
+        Порог проверяет бэкенд (Threshold Evaluator). При срабатывании он открывает инцидент
+        и сам отправляет уведомления во все каналы из `channelIds` (пуш, почта, Telegram) —
+        приложение в отправке не участвует. Роль — `admin`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ThresholdInput'
+            examples:
+              nodeCpu:
+                summary: CPU любого узла > 99% дольше минуты
+                value:
+                  name: CPU почти 100%
+                  enabled: true
+                  target:
+                    kind: node_metric
+                    nodeId: null
+                    metric: cpuUsagePercent
+                  condition:
+                    operator: gt
+                    value: 99
+                  forSeconds: 60
+                  severity: critical
+                  channelIds: [3f9a1c2e-0000-4000-8000-000000000001]
+                  cooldownSeconds: 900
+              tableRows:
+                summary: В таблице больше 100 млн строк
+                value:
+                  name: k8s_nodes переполнена
+                  enabled: true
+                  target:
+                    kind: table_metric
+                    tableId: public.k8s_nodes
+                    metric: rowCount
+                  condition:
+                    operator: gt
+                    value: 100000000
+                  forSeconds: 0
+                  severity: warning
+                  channelIds: [3f9a1c2e-0000-4000-8000-000000000002]
+                  cooldownSeconds: 3600
+              columnValue:
+                summary: memory_utilization > 92 (среднее за минуту)
+                value:
+                  name: Память нод k8s
+                  enabled: true
+                  target:
+                    kind: column
+                    tableId: public.k8s_nodes
+                    column: memory_utilization
+                    aggregation: avg
+                    windowSeconds: 60
+                  condition:
+                    operator: gt
+                    value: 92
+                  forSeconds: 120
+                  severity: warning
+                  channelIds: [3f9a1c2e-0000-4000-8000-000000000001]
+                  cooldownSeconds: 600
+      responses:
+        '201':
+          description: Порог создан
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Threshold'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          description: Цель не найдена или не подходит (нет такой таблицы, колонка не числовая, неизвестный канал)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /thresholds/{thresholdId}:
+    parameters:
+      - $ref: '#/components/parameters/ThresholdId'
+    get:
+      tags: [Thresholds]
+      operationId: getThreshold
+      summary: Порог
+      description: Роль — любая.
+      responses:
+        '200':
+          description: Порог
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Threshold'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Thresholds]
+      operationId: replaceThreshold
+      summary: Изменить порог целиком
+      description: Роль — `admin`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ThresholdInput'
+      responses:
+        '200':
+          description: Порог обновлён
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Threshold'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+    patch:
+      tags: [Thresholds]
+      operationId: patchThreshold
+      summary: Частично изменить порог (например, включить или выключить)
+      description: |
+        JSON Merge Patch (RFC 7396): передаются только меняемые поля.
+        Типичный случай — переключатель на карточке порога: `{"enabled": false}`. Роль — `admin`.
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/ThresholdPatch'
+            example:
+              enabled: false
+      responses:
+        '200':
+          description: Порог обновлён
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Threshold'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+    delete:
+      tags: [Thresholds]
+      operationId: deleteThreshold
+      summary: Удалить порог
+      description: Открытые инциденты по порогу остаются в журнале и закрываются автоматически. Роль — `admin`.
+      responses:
+        '204':
+          description: Порог удалён
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ---------------------------------------------------------------- Notification channels
+
+  /notification-channels:
+    get:
+      tags: [Notification channels]
+      operationId: listNotificationChannels
+      summary: Каналы уведомлений
+      description: Роль — любая. Секреты (токен Telegram-бота) в ответе не возвращаются.
+      responses:
+        '200':
+          description: Каналы
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/NotificationChannel'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Notification channels]
+      operationId: createNotificationChannel
+      summary: Создать канал уведомлений
+      description: |
+        Куда бэкенд отправляет алерты:
+        - `push` — пуш на зарегистрированные устройства выбранных пользователей (`POST /me/devices`);
+        - `email` — письмо на список адресов;
+        - `telegram` — сообщение в чат через бота.
+        Отправку делает Java-сервис напрямую, не через приложение. Роль — `admin`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotificationChannelInput'
+            examples:
+              push:
+                summary: Пуш дежурным
+                value:
+                  name: Пуш дежурным DBA
+                  config:
+                    type: push
+                    userIds: [admin, operator]
+              email:
+                summary: Почта
+                value:
+                  name: Почта команды эксплуатации
+                  config:
+                    type: email
+                    recipients: [dba-oncall@client.local]
+              telegram:
+                summary: Telegram
+                value:
+                  name: Чат алертов
+                  config:
+                    type: telegram
+                    chatId: '-1001234567890'
+                    botToken: '123456:ABC-DEF'
+      responses:
+        '201':
+          description: Канал создан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationChannel'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /notification-channels/{channelId}:
+    parameters:
+      - $ref: '#/components/parameters/ChannelId'
+    put:
+      tags: [Notification channels]
+      operationId: replaceNotificationChannel
+      summary: Изменить канал
+      description: Если `botToken` не передан, сохраняется прежний. Роль — `admin`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotificationChannelInput'
+      responses:
+        '200':
+          description: Канал обновлён
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationChannel'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Notification channels]
+      operationId: deleteNotificationChannel
+      summary: Удалить канал
+      description: Нельзя удалить канал, который используется в порогах — сначала уберите его из них. Роль — `admin`.
+      responses:
+        '204':
+          description: Канал удалён
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Канал используется в порогах
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /notification-channels/{channelId}/test:
+    post:
+      tags: [Notification channels]
+      operationId: testNotificationChannel
+      summary: Отправить тестовое уведомление
+      description: Кнопка «Проверить» в настройках канала. Роль — `admin`.
+      parameters:
+        - $ref: '#/components/parameters/ChannelId'
+      responses:
+        '202':
+          description: Тестовое уведомление отправлено в очередь
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '502':
+          description: Внешний сервис (почта, Telegram, push-провайдер) отклонил отправку
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  # ---------------------------------------------------------------- Incidents
+
+  /incidents:
+    get:
+      tags: [Incidents]
+      operationId: listIncidents
+      summary: Журнал инцидентов
+      description: |
+        Сработавшие пороги, новые сверху. Жизненный цикл инцидента:
+        `open` → `acknowledged` (взят в работу) → `resolved`.
+        Инцидент закрывается автоматически, когда значение вернулось в норму
+        (`resolution: auto`), или вручную (`resolution: manual`).
+        Новые инциденты и смена статуса приходят по WebSocket (канал `incidents`). Роль — любая.
+      parameters:
+        - name: status
+          in: query
+          description: Можно несколько через запятую, например `open,acknowledged`
+          style: form
+          explode: false
+          schema:
+            type: array
+            items:
+              $ref: '#/components/schemas/IncidentStatus'
+        - name: severity
+          in: query
+          schema:
+            $ref: '#/components/schemas/Severity'
+        - name: thresholdId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: from
+          in: query
+          description: Открыт не раньше
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          description: Открыт не позже
+          schema:
+            type: string
+            format: date-time
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Инциденты
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /incidents/{incidentId}:
+    get:
+      tags: [Incidents]
+      operationId: getIncident
+      summary: Инцидент
+      description: Сюда ведёт нажатие на пуш-уведомление (в пуше передаётся `incidentId`). Роль — любая.
+      parameters:
+        - $ref: '#/components/parameters/IncidentId'
+      responses:
+        '200':
+          description: Инцидент
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Incident'
+              example:
+                id: 0c7d9f2a-1b3e-4c5d-8e9f-a0b1c2d3e4f5
+                thresholdId: 5a1b2c3d-4e5f-4061-8a9b-c0d1e2f3a4b5
+                thresholdName: CPU почти 100%
+                status: open
+                severity: critical
+                target:
+                  kind: node_metric
+                  nodeId: node-1
+                  metric: cpuUsagePercent
+                condition:
+                  operator: gt
+                  value: 99
+                observedValue: 99.7
+                openedAt: '2026-10-23T03:12:40Z'
+                acknowledgedAt: null
+                acknowledgedBy: null
+                resolvedAt: null
+                resolvedBy: null
+                resolution: null
+                comment: null
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /incidents/{incidentId}/acknowledge:
+    post:
+      tags: [Incidents]
+      operationId: acknowledgeIncident
+      summary: Взять инцидент в работу
+      description: |
+        Кнопка «Принять» на карточке инцидента или в пуше. Повторные уведомления по инциденту
+        после этого не отправляются. Повторный вызов для уже подтверждённого инцидента
+        ничего не меняет и возвращает `200`. Роль — `operator` или `admin`.
+      parameters:
+        - $ref: '#/components/parameters/IncidentId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IncidentComment'
+      responses:
+        '200':
+          description: Инцидент взят в работу
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Incident'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Инцидент уже закрыт
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /incidents/{incidentId}/resolve:
+    post:
+      tags: [Incidents]
+      operationId: resolveIncident
+      summary: Закрыть инцидент вручную
+      description: Роль — `operator` или `admin`.
+      parameters:
+        - $ref: '#/components/parameters/IncidentId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IncidentComment'
+            example:
+              comment: Перезапустили сборщик, нагрузка в норме
+      responses:
+        '200':
+          description: Инцидент закрыт
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Incident'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ---------------------------------------------------------------- Realtime (WebSocket)
+
+  /ws:
+    get:
+      tags: [Realtime]
+      operationId: openWebSocket
+      summary: WebSocket — графики и живые обновления
+      description: |
+        Единое WebSocket-соединение (`wss://{host}/api/v1/ws`) на всё приложение.
+        По нему идут **все графики**, обновления главного экрана, новые инциденты
+        и статусы быстрых команд. REST при этом отдаёт только снимки и справочники.
+
+        OpenAPI не умеет полноценно описывать WebSocket, поэтому здесь описан handshake,
+        а форматы сообщений — схемы `WsClientMessage` (клиент → сервер) и `WsServerMessage`
+        (сервер → клиент) в `components`. Все сообщения — текстовые фреймы с JSON,
+        тип определяется полем `type`.
+
+        ### 1. Подключение и авторизация
+        1. Клиент открывает соединение без токена в URL (чтобы токен не попадал в логи прокси).
+        2. Первым сообщением, не позже 5 секунд, клиент шлёт `{"type":"auth","token":"<accessToken>"}`.
+        3. Сервер отвечает `auth.ok`. Иначе закрывает соединение с кодом `4401` или `4408`.
+        4. Когда access-токен скоро истечёт, клиент шлёт новый `auth` в том же соединении — переподключаться не нужно.
+
+        ### 2. Подписки
+        Клиент шлёт `subscribe` со своим `subscriptionId` (любая уникальная строка) и каналом:
+
+        | Канал | Параметры | Что приходит | Экран |
+        | --- | --- | --- | --- |
+        | `cluster` | — | `cluster.snapshot`, затем `cluster.update` (по умолчанию раз в 1 с) | Кластер |
+        | `chart` | `tableId`, `chartId`, `range`, `aggregation` | `chart.snapshot`, затем `chart.points` | Графики |
+        | `incidents` | — | `incident.event` при открытии и смене статуса | Пороги и алерты |
+        | `action_runs` | `runId` (необязательно) | `action_run.update` при смене статуса | Быстрые команды |
+
+        Сервер подтверждает подписку сообщением `subscribed` или присылает `error`
+        с тем же `subscriptionId`. Отписка — `unsubscribe`. При уходе с экрана
+        клиент должен отписываться, чтобы сервер не гонял лишние данные.
+
+        ### 3. Графики
+        - После `subscribe` на `chart` сервер присылает `chart.snapshot`: агрегированную историю
+          за выбранный диапазон (агрегация выполняется в БД) и пороги для наложения линий на график.
+        - Затем приходят `chart.points` — новые точки, не чаще 10 раз в секунду (пачками).
+          Клиент складывает их в кольцевой буфер и рисует 60 FPS сам, сдвигая окно графика.
+        - Смена диапазона (LIVE / 15 мин / 1 час / 24 часа) или агрегации — новый `subscribe`
+          с тем же `subscriptionId`: сервер заменит подписку и пришлёт новый `chart.snapshot`.
+        - Шаг агрегации выбирает сервер и сообщает в `stepMs`. Ориентиры: `live` — 1 с,
+          `15m` — 5 с, `1h` — 15 с, `24h` — 5 мин.
+        - Точка — пара `[timestampMs, value]`. `value: null` — данных за интервал нет (разрыв линии).
+
+        ### 4. Поддержание соединения
+        - Клиент шлёт `ping` каждые 30 с, сервер отвечает `pong`. Без сообщений 90 с сервер закрывает соединение.
+        - После обрыва клиент переподключается с экспоненциальной задержкой (1, 2, 4… до 30 с),
+          заново проходит `auth` и восстанавливает подписки. Снимки придут заново.
+
+        ### 5. Коды закрытия
+        | Код | Причина |
+        | --- | --- |
+        | `1000` | Нормальное закрытие |
+        | `4400` | Некорректное сообщение |
+        | `4401` | Токен невалиден или истёк |
+        | `4403` | Недостаточно прав |
+        | `4408` | Не прислан `auth` за 5 секунд |
+        | `4429` | Слишком много подписок (лимит — 20 на соединение) |
+
+        ### Пример обмена
+        ```
+        → {"type":"auth","token":"eyJ..."}
+        ← {"type":"auth.ok","user":{"id":"admin","roles":["admin"]},"serverTime":1792746900000}
+        → {"type":"subscribe","subscriptionId":"chart-1","channel":"chart",
+           "params":{"tableId":"public.k8s_nodes","chartId":"column:memory_utilization",
+                     "range":"15m","aggregation":"avg"}}
+        ← {"type":"subscribed","subscriptionId":"chart-1"}
+        ← {"type":"chart.snapshot","subscriptionId":"chart-1","chartId":"column:memory_utilization",
+           "range":"15m","aggregation":"avg","stepMs":5000,"unit":null,
+           "from":1792746000000,"to":1792746900000,
+           "points":[[1792746000000,71.2],[1792746005000,71.9]],
+           "thresholds":[{"thresholdId":"5a1b...","name":"Память нод k8s","operator":"gt","value":92,"severity":"warning"}]}
+        ← {"type":"chart.points","subscriptionId":"chart-1","points":[[1792746905000,72.4]]}
+        → {"type":"unsubscribe","subscriptionId":"chart-1"}
+        ```
+      security: []
+      parameters:
+        - name: Upgrade
+          in: header
+          required: true
+          schema:
+            type: string
+            const: websocket
+        - name: Connection
+          in: header
+          required: true
+          schema:
+            type: string
+            const: Upgrade
+        - name: Sec-WebSocket-Version
+          in: header
+          required: true
+          schema:
+            type: string
+            const: '13'
+        - name: Sec-WebSocket-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        '101':
+          description: Switching Protocols — соединение установлено, дальше обмен сообщениями `WsClientMessage` / `WsServerMessage`
+        '426':
+          description: Запрос без Upgrade на WebSocket
+      x-websocket:
+        clientMessages:
+          $ref: '#/components/schemas/WsClientMessage'
+        serverMessages:
+          $ref: '#/components/schemas/WsServerMessage'
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Access-токен из `POST /auth/login` (заглушка) или из системы входа клиента (режим `oidc`).
+        Роли пользователя — в claim `roles`.
+
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      description: Размер страницы
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    Cursor:
+      name: cursor
+      in: query
+      description: Курсор из `nextCursor` предыдущей страницы
+      schema:
+        type: string
+    NodeId:
+      name: nodeId
+      in: path
+      required: true
+      schema:
+        type: string
+      example: node-1
+    TableId:
+      name: tableId
+      in: path
+      required: true
+      description: Полное имя таблицы `schema.table`
+      schema:
+        type: string
+        pattern: '^[^.]+\.[^.]+$'
+      example: public.k8s_nodes
+    ActionId:
+      name: actionId
+      in: path
+      required: true
+      schema:
+        type: string
+      example: force_compaction
+    RunId:
+      name: runId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ThresholdId:
+      name: thresholdId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ChannelId:
+      name: channelId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    IncidentId:
+      name: incidentId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    DeviceId:
+      name: deviceId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Уникальная строка (UUID) на одно нажатие кнопки. Повтор запроса с тем же ключом
+        в течение 24 часов вернёт уже созданный запуск, а не запустит команду ещё раз.
+      schema:
+        type: string
+        maxLength: 64
+
+  responses:
+    BadRequest:
+      description: Некорректный запрос (валидация)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://ruchronos.dev/problems/validation
+            title: Ошибка валидации
+            status: 400
+            code: validation_error
+            detail: 'condition.value: обязательное поле'
+            errors:
+              - field: condition.value
+                message: обязательное поле
+    Unauthorized:
+      description: Нет токена, токен невалиден или истёк
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://ruchronos.dev/problems/unauthorized
+            title: Требуется авторизация
+            status: 401
+            code: token_expired
+    Forbidden:
+      description: Недостаточно прав для операции
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://ruchronos.dev/problems/forbidden
+            title: Недостаточно прав
+            status: 403
+            code: role_required
+            detail: Требуется роль admin
+    NotFound:
+      description: Объект не найден
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unprocessable:
+      description: Запрос корректен по формату, но не может быть выполнен
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooManyRequests:
+      description: Слишком много попыток, повторите позже
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ClusterUnavailable:
+      description: Бэкенд не может подключиться к PostgreSQL
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://ruchronos.dev/problems/cluster-unavailable
+            title: Кластер недоступен
+            status: 503
+            code: cluster_unavailable
+
+  schemas:
+
+    # ------------------------------------------------------------ Common
+
+    Problem:
+      type: object
+      description: Ошибка в формате RFC 9457 (Problem Details)
+      required: [type, title, status, code]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        code:
+          type: string
+          description: Машиночитаемый код ошибки
+        detail:
+          type: string
+        instance:
+          type: string
+        errors:
+          type: array
+          description: Ошибки по полям (для `400`)
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field:
+                type: string
+              message:
+                type: string
+
+    Health:
+      type: object
+      required: [status, version, database]
+      properties:
+        status:
+          type: string
+          enum: [up, degraded, down]
+        version:
+          type: string
+        database:
+          type: string
+          enum: [up, down]
+          description: Есть ли соединение бэкенда с PostgreSQL
+
+    Severity:
+      type: string
+      enum: [info, warning, critical]
+
+    # ------------------------------------------------------------ Auth / Me
+
+    AuthConfig:
+      type: object
+      required: [mode, oidc]
+      properties:
+        mode:
+          type: string
+          enum: [mock, oidc]
+          description: |
+            `mock` — форма логина и пароля, `POST /auth/login` (текущий этап).
+            `oidc` — вход через систему клиента по OpenID Connect (Authorization Code + PKCE).
+        oidc:
+          oneOf:
+            - type: 'null'
+            - type: object
+              required: [issuer, clientId, scopes]
+              properties:
+                issuer:
+                  type: string
+                  format: uri
+                clientId:
+                  type: string
+                scopes:
+                  type: array
+                  items:
+                    type: string
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+          format: password
+
+    RefreshRequest:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken:
+          type: string
+
+    TokenPair:
+      type: object
+      required: [accessToken, refreshToken, tokenType, expiresIn]
+      properties:
+        accessToken:
+          type: string
+          description: JWT
+        refreshToken:
+          type: string
+        tokenType:
+          type: string
+          const: Bearer
+        expiresIn:
+          type: integer
+          description: Время жизни access-токена, секунды
+          example: 900
+
+    Role:
+      type: string
+      enum: [viewer, operator, admin]
+      description: |
+        `viewer` — только чтение. `operator` — плюс быстрые команды без подтверждения,
+        подтверждение и закрытие инцидентов. `admin` — всё, включая пороги, каналы
+        и команды с подтверждением.
+
+    User:
+      type: object
+      required: [id, username, displayName, roles]
+      properties:
+        id:
+          type: string
+        username:
+          type: string
+        displayName:
+          type: string
+        roles:
+          type: array
+          items:
+            $ref: '#/components/schemas/Role'
+
+    DeviceRegistration:
+      type: object
+      required: [provider, pushToken, platform]
+      properties:
+        provider:
+          type: string
+          enum: [fcm, apns, rustore]
+          description: Сервис доставки пушей. `rustore` — RuStore Push для устройств без сервисов Google.
+        pushToken:
+          type: string
+        platform:
+          type: string
+          enum: [android, ios, web]
+        deviceName:
+          type: string
+
+    Device:
+      allOf:
+        - $ref: '#/components/schemas/DeviceRegistration'
+        - type: object
+          required: [id, createdAt, lastSeenAt]
+          properties:
+            id:
+              type: string
+              format: uuid
+            createdAt:
+              type: string
+              format: date-time
+            lastSeenAt:
+              type: string
+              format: date-time
+
+    # ------------------------------------------------------------ Cluster
+
+    ClusterOverview:
+      type: object
+      required: [name, status, primary, replicas, updatedAt]
+      properties:
+        name:
+          type: string
+        status:
+          type: string
+          enum: [healthy, degraded, critical, unknown]
+          description: |
+            Сводный статус для цвета на главном экране: `degraded` — хотя бы одна реплика
+            недоступна или отстаёт; `critical` — мастер недоступен.
+        primary:
+          $ref: '#/components/schemas/NodeState'
+        replicas:
+          type: array
+          items:
+            $ref: '#/components/schemas/NodeState'
+        updatedAt:
+          type: string
+          format: date-time
+
+    NodeState:
+      type: object
+      required: [id, role, host, port, status, metrics, replication]
+      properties:
+        id:
+          type: string
+        role:
+          type: string
+          enum: [primary, replica]
+          description: '`primary` — мастер, `replica` — реплика'
+        host:
+          type: string
+        port:
+          type: integer
+        status:
+          type: string
+          enum: [online, degraded, offline]
+        postgresVersion:
+          type: string
+        ruchronosVersion:
+          type: string
+          description: Версия расширения RuChronos Core на узле
+        metrics:
+          $ref: '#/components/schemas/NodeMetrics'
+        replication:
+          description: Только для реплик, у мастера `null`
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/ReplicationState'
+
+    NodeMetrics:
+      type: object
+      description: |
+        Текущие метрики узла. Имена полей совпадают с ключами `NodeMetricKey`.
+        Метрика, которую узел не умеет отдавать (например, температура в виртуалке), — `null`.
+        Собираются агентом на узле из стандартных средств Linux (`/proc`, `df`, `top`)
+        и статистики PostgreSQL / RuChronos.
+      required:
+        - cpuUsagePercent
+        - ramUsagePercent
+        - ramUsedBytes
+        - ramTotalBytes
+        - diskUsagePercent
+        - diskUsedBytes
+        - diskTotalBytes
+      properties:
+        cpuUsagePercent:
+          type: number
+          minimum: 0
+          maximum: 100
+        ramUsagePercent:
+          type: number
+          minimum: 0
+          maximum: 100
+        ramUsedBytes:
+          type: integer
+          format: int64
+        ramTotalBytes:
+          type: integer
+          format: int64
+        diskUsagePercent:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: Заполненность диска с каталогом данных PostgreSQL
+        diskUsedBytes:
+          type: integer
+          format: int64
+        diskTotalBytes:
+          type: integer
+          format: int64
+        temperatureCelsius:
+          type: [number, 'null']
+          description: Необязательная метрика, «если есть возможность»
+        ingestionRate:
+          type: [number, 'null']
+          description: Скорость вставки во все таблицы RuChronos на узле, строк/с
+        compressionRatio:
+          type: [number, 'null']
+          description: Средний коэффициент сжатия TAM (во сколько раз данные меньше, чем в heap)
+        walWriteBytesPerSec:
+          type: [number, 'null']
+          description: Активность кастомного WAL, байт/с
+        replicationLagMs:
+          type: [number, 'null']
+          description: Лаг репликации, мс (только у реплик)
+
+    NodeMetricKey:
+      type: string
+      description: Ключ метрики узла — совпадает с именем поля в `NodeMetrics`
+      enum:
+        - cpuUsagePercent
+        - ramUsagePercent
+        - diskUsagePercent
+        - temperatureCelsius
+        - ingestionRate
+        - compressionRatio
+        - walWriteBytesPerSec
+        - replicationLagMs
+
+    ReplicationState:
+      type: object
+      required: [state, lagMs]
+      properties:
+        state:
+          type: string
+          enum: [streaming, catchup, stopped]
+        lagMs:
+          type: number
+        lagBytes:
+          type: integer
+          format: int64
+
+    MetricDescriptor:
+      type: object
+      required: [key, title, unit, supported]
+      properties:
+        key:
+          $ref: '#/components/schemas/NodeMetricKey'
+        title:
+          type: string
+        unit:
+          $ref: '#/components/schemas/Unit'
+        min:
+          type: [number, 'null']
+        max:
+          type: [number, 'null']
+        supported:
+          type: boolean
+          description: Отдаёт ли эту метрику текущая инсталляция (например, температура — не везде)
+
+    Unit:
+      type: [string, 'null']
+      enum: [percent, bytes, bytes_per_sec, rows, rows_per_sec, ms, celsius, ratio, null]
+
+    # ------------------------------------------------------------ Tables
+
+    AccessMethod:
+      type: string
+      enum: [ruchronos_tam, heap, other]
+      description: Движок хранения таблицы. `ruchronos_tam` — создана через `USING ruchronos_tam`.
+
+    TableSummary:
+      type: object
+      required: [id, schema, name, accessMethod, rowCountEstimate, sizeBytes, compressionRatio]
+      properties:
+        id:
+          type: string
+          description: '`schema.table`'
+        schema:
+          type: string
+        name:
+          type: string
+        accessMethod:
+          $ref: '#/components/schemas/AccessMethod'
+        rowCountEstimate:
+          type: integer
+          format: int64
+          description: Оценка числа строк по статистике (быстро, без `count(*)`)
+        sizeBytes:
+          type: integer
+          format: int64
+        compressionRatio:
+          type: [number, 'null']
+          description: Только для таблиц RuChronos, иначе `null`
+
+    TableDetails:
+      allOf:
+        - $ref: '#/components/schemas/TableSummary'
+        - type: object
+          required: [columns, timeColumn, charts]
+          properties:
+            columns:
+              type: array
+              items:
+                $ref: '#/components/schemas/TableColumn'
+            timeColumn:
+              type: [string, 'null']
+              description: Колонка времени, по которой строятся графики колонок. `null` — её нет, доступен только `ingestion_rate`.
+            charts:
+              type: array
+              description: Графики, которые можно построить. Первым всегда идёт `ingestion_rate`.
+              items:
+                $ref: '#/components/schemas/ChartDescriptor'
+
+    TableColumn:
+      type: object
+      required: [name, dataType, nullable, kind]
+      properties:
+        name:
+          type: string
+        dataType:
+          type: string
+          description: Тип PostgreSQL как есть (`timestamptz`, `double precision`, `bigint`, `text`…)
+        nullable:
+          type: boolean
+        kind:
+          type: string
+          enum: [time, numeric, text, other]
+          description: Упрощённый тип для приложения — от него зависят доступные графики и пороги
+
+    ChartDescriptor:
+      type: object
+      required: [id, type, title, unit, column, aggregations, defaultAggregation]
+      properties:
+        id:
+          type: string
+          description: '`ingestion_rate` или `column:<имя колонки>`. Передаётся в подписке `chart`.'
+          examples: [ingestion_rate, 'column:memory_utilization']
+        type:
+          type: string
+          enum: [ingestion_rate, column]
+        title:
+          type: string
+        unit:
+          $ref: '#/components/schemas/Unit'
+        column:
+          type: [string, 'null']
+        aggregations:
+          type: array
+          items:
+            $ref: '#/components/schemas/Aggregation'
+        defaultAggregation:
+          $ref: '#/components/schemas/Aggregation'
+
+    Aggregation:
+      type: string
+      enum: [avg, min, max, last, sum, count]
+      description: Как сворачивать значения внутри одного интервала (шага) графика или окна порога
+
+    ChartRange:
+      type: string
+      enum: [live, 15m, 1h, 24h]
+      description: Переключатель диапазона на экране графика
+
+    TableSummaryPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TableSummary'
+        nextCursor:
+          type: [string, 'null']
+
+    # ------------------------------------------------------------ Quick actions
+
+    QuickAction:
+      type: object
+      required: [id, title, description, category, target, params, requiresConfirmation, minRole]
+      description: |
+        Кнопка на экране быстрых команд. Каталог на сервере — белый список.
+        Начальный набор: `collect_diagnostics` (снимок pg_stat_*), `top_queries`
+        (тяжёлые запросы из pg_stat_statements), `analyze_table` (`ANALYZE` для обновления
+        статистики), `force_compaction` (сжатие чанков RuChronos), `apply_retention`
+        (очистка по уже настроенной политике хранения, только с подтверждением),
+        `failover_check` (проверка готовности реплики к переключению — без самого переключения).
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+        category:
+          type: string
+          enum: [diagnostics, maintenance, replication]
+        target:
+          type: string
+          enum: [cluster, node, table]
+          description: К чему применяется команда — от этого зависит, что спросить у пользователя перед запуском
+        params:
+          type: array
+          items:
+            $ref: '#/components/schemas/ActionParam'
+        requiresConfirmation:
+          type: boolean
+          description: 'Показать диалог подтверждения и передать `confirm: true`'
+        minRole:
+          $ref: '#/components/schemas/Role'
+
+    ActionParam:
+      type: object
+      required: [name, type, required]
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+          enum: [integer, number, string, boolean]
+        required:
+          type: boolean
+        default: {}
+        description:
+          type: string
+
+    ActionRunRequest:
+      type: object
+      required: [target]
+      properties:
+        target:
+          $ref: '#/components/schemas/ActionTarget'
+        params:
+          type: object
+          additionalProperties: true
+          description: Значения параметров по описанию `QuickAction.params`
+        confirm:
+          type: boolean
+          default: false
+
+    ActionTarget:
+      type: object
+      description: 'Пустой объект для команд с `target: cluster`'
+      properties:
+        nodeId:
+          type: string
+        tableId:
+          type: string
+
+    ActionRunStatus:
+      type: string
+      enum: [queued, running, succeeded, failed]
+
+    ActionRun:
+      type: object
+      required: [id, actionId, status, target, params, startedBy, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        actionId:
+          type: string
+        status:
+          $ref: '#/components/schemas/ActionRunStatus'
+        target:
+          $ref: '#/components/schemas/ActionTarget'
+        params:
+          type: object
+          additionalProperties: true
+        startedBy:
+          type: string
+          description: Пользователь, запустивший команду (для аудита)
+        createdAt:
+          type: string
+          format: date-time
+        startedAt:
+          type: [string, 'null']
+          format: date-time
+        finishedAt:
+          type: [string, 'null']
+          format: date-time
+        result:
+          description: Есть при `succeeded`
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/ActionResult'
+        error:
+          description: Есть при `failed`
+          oneOf:
+            - type: 'null'
+            - type: object
+              required: [code, message]
+              properties:
+                code:
+                  type: string
+                message:
+                  type: string
+
+    ActionResult:
+      type: object
+      required: [summary]
+      properties:
+        summary:
+          type: string
+          description: Короткий итог для показа на экране
+        table:
+          description: Результат в виде таблицы (для диагностических команд)
+          type: object
+          required: [columns, rows]
+          properties:
+            columns:
+              type: array
+              items:
+                type: string
+            rows:
+              type: array
+              items:
+                type: array
+                items: {}
+
+    ActionRunPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ActionRun'
+        nextCursor:
+          type: [string, 'null']
+
+    # ------------------------------------------------------------ Thresholds
+
+    ThresholdTargetKind:
+      type: string
+      enum: [node_metric, table_metric, column]
+
+    ThresholdTarget:
+      description: На что повешен порог
+      oneOf:
+        - $ref: '#/components/schemas/NodeMetricTarget'
+        - $ref: '#/components/schemas/TableMetricTarget'
+        - $ref: '#/components/schemas/ColumnTarget'
+      discriminator:
+        propertyName: kind
+        mapping:
+          node_metric: '#/components/schemas/NodeMetricTarget'
+          table_metric: '#/components/schemas/TableMetricTarget'
+          column: '#/components/schemas/ColumnTarget'
+
+    NodeMetricTarget:
+      type: object
+      required: [kind, nodeId, metric]
+      properties:
+        kind:
+          type: string
+          const: node_metric
+        nodeId:
+          type: [string, 'null']
+          description: Конкретный узел или `null` — порог на каждый узел кластера
+        metric:
+          $ref: '#/components/schemas/NodeMetricKey'
+
+    TableMetricTarget:
+      type: object
+      required: [kind, tableId, metric]
+      properties:
+        kind:
+          type: string
+          const: table_metric
+        tableId:
+          type: string
+        metric:
+          type: string
+          enum: [rowCount, sizeBytes, ingestionRate]
+          description: '`rowCount` — заполненность таблицы (строк), `sizeBytes` — размер на диске, `ingestionRate` — строк/с'
+
+    ColumnTarget:
+      type: object
+      required: [kind, tableId, column, aggregation, windowSeconds]
+      properties:
+        kind:
+          type: string
+          const: column
+        tableId:
+          type: string
+        column:
+          type: string
+          description: Числовая колонка таблицы с колонкой времени
+        aggregation:
+          $ref: '#/components/schemas/Aggregation'
+        windowSeconds:
+          type: integer
+          minimum: 1
+          maximum: 86400
+          description: Окно, за которое считается агрегат (например, среднее за последние 60 с)
+
+    ThresholdCondition:
+      type: object
+      required: [operator, value]
+      properties:
+        operator:
+          type: string
+          enum: [gt, gte, lt, lte]
+          description: '`gt` — больше, `gte` — больше или равно, `lt` — меньше, `lte` — меньше или равно'
+        value:
+          type: number
+
+    ThresholdInput:
+      type: object
+      required: [name, target, condition, severity, channelIds]
+      properties:
+        name:
+          type: string
+          maxLength: 120
+        enabled:
+          type: boolean
+          default: true
+        target:
+          $ref: '#/components/schemas/ThresholdTarget'
+        condition:
+          $ref: '#/components/schemas/ThresholdCondition'
+        forSeconds:
+          type: integer
+          minimum: 0
+          default: 0
+          description: Сколько секунд условие должно держаться, прежде чем открыть инцидент (защита от кратких всплесков)
+        severity:
+          $ref: '#/components/schemas/Severity'
+        channelIds:
+          type: array
+          description: Каналы уведомлений. Пустой список — инцидент только в журнале, без уведомлений.
+          items:
+            type: string
+            format: uuid
+        cooldownSeconds:
+          type: integer
+          minimum: 0
+          default: 900
+          description: Не повторять уведомление по открытому инциденту чаще, чем раз в N секунд
+
+    ThresholdPatch:
+      type: object
+      description: Любое подмножество полей `ThresholdInput`
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          maxLength: 120
+        enabled:
+          type: boolean
+        target:
+          $ref: '#/components/schemas/ThresholdTarget'
+        condition:
+          $ref: '#/components/schemas/ThresholdCondition'
+        forSeconds:
+          type: integer
+          minimum: 0
+        severity:
+          $ref: '#/components/schemas/Severity'
+        channelIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+        cooldownSeconds:
+          type: integer
+          minimum: 0
+
+    Threshold:
+      allOf:
+        - $ref: '#/components/schemas/ThresholdInput'
+        - type: object
+          required: [id, enabled, state, createdAt, updatedAt, createdBy]
+          properties:
+            id:
+              type: string
+              format: uuid
+            state:
+              type: string
+              enum: [ok, firing, no_data, disabled]
+              description: Текущее состояние проверки (для цвета карточки порога)
+            createdAt:
+              type: string
+              format: date-time
+            updatedAt:
+              type: string
+              format: date-time
+            createdBy:
+              type: string
+
+    ThresholdPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Threshold'
+        nextCursor:
+          type: [string, 'null']
+
+    # ------------------------------------------------------------ Notification channels
+
+    NotificationChannelInput:
+      type: object
+      required: [name, config]
+      properties:
+        name:
+          type: string
+          maxLength: 120
+        config:
+          $ref: '#/components/schemas/NotificationChannelConfig'
+
+    NotificationChannelConfig:
+      oneOf:
+        - $ref: '#/components/schemas/PushChannelConfig'
+        - $ref: '#/components/schemas/EmailChannelConfig'
+        - $ref: '#/components/schemas/TelegramChannelConfig'
+      discriminator:
+        propertyName: type
+        mapping:
+          push: '#/components/schemas/PushChannelConfig'
+          email: '#/components/schemas/EmailChannelConfig'
+          telegram: '#/components/schemas/TelegramChannelConfig'
+
+    PushChannelConfig:
+      type: object
+      required: [type, userIds]
+      properties:
+        type:
+          type: string
+          const: push
+        userIds:
+          type: array
+          description: Пуш уходит на все зарегистрированные устройства этих пользователей
+          items:
+            type: string
+
+    EmailChannelConfig:
+      type: object
+      required: [type, recipients]
+      properties:
+        type:
+          type: string
+          const: email
+        recipients:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            format: email
+
+    TelegramChannelConfig:
+      type: object
+      required: [type, chatId]
+      properties:
+        type:
+          type: string
+          const: telegram
+        chatId:
+          type: string
+        botToken:
+          type: string
+          writeOnly: true
+          description: Токен бота. Только на запись — в ответах не возвращается.
+
+    NotificationChannel:
+      allOf:
+        - $ref: '#/components/schemas/NotificationChannelInput'
+        - type: object
+          required: [id, createdAt]
+          properties:
+            id:
+              type: string
+              format: uuid
+            createdAt:
+              type: string
+              format: date-time
+            usedByThresholds:
+              type: integer
+              description: Во скольких порогах используется канал
+
+    # ------------------------------------------------------------ Incidents
+
+    IncidentStatus:
+      type: string
+      enum: [open, acknowledged, resolved]
+      description: В интерфейсе показывается как OPEN / ACKNOWLEDGED / RESOLVED
+
+    Incident:
+      type: object
+      required: [id, thresholdId, thresholdName, status, severity, target, condition, observedValue, openedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        thresholdId:
+          type: string
+          format: uuid
+        thresholdName:
+          type: string
+          description: Имя порога на момент срабатывания
+        status:
+          $ref: '#/components/schemas/IncidentStatus'
+        severity:
+          $ref: '#/components/schemas/Severity'
+        target:
+          $ref: '#/components/schemas/ThresholdTarget'
+        condition:
+          $ref: '#/components/schemas/ThresholdCondition'
+        observedValue:
+          type: number
+          description: Значение, при котором порог сработал
+        openedAt:
+          type: string
+          format: date-time
+        acknowledgedAt:
+          type: [string, 'null']
+          format: date-time
+        acknowledgedBy:
+          type: [string, 'null']
+        resolvedAt:
+          type: [string, 'null']
+          format: date-time
+        resolvedBy:
+          type: [string, 'null']
+          description: '`null` при автоматическом закрытии'
+        resolution:
+          type: [string, 'null']
+          enum: [auto, manual, threshold_deleted, null]
+        comment:
+          type: [string, 'null']
+
+    IncidentComment:
+      type: object
+      properties:
+        comment:
+          type: string
+          maxLength: 1000
+
+    IncidentPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Incident'
+        nextCursor:
+          type: [string, 'null']
+
+    # ------------------------------------------------------------ WebSocket messages
+
+    ChartPoint:
+      type: array
+      description: '`[timestampMs, value]`. `value: null` — данных за интервал нет.'
+      prefixItems:
+        - type: integer
+          format: int64
+        - type: [number, 'null']
+      minItems: 2
+      maxItems: 2
+      examples:
+        - [1792746905000, 72.4]
+
+    ChartThresholdLine:
+      type: object
+      description: Линия порога для наложения на график
+      required: [thresholdId, name, operator, value, severity]
+      properties:
+        thresholdId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        operator:
+          type: string
+          enum: [gt, gte, lt, lte]
+        value:
+          type: number
+        severity:
+          $ref: '#/components/schemas/Severity'
+
+    WsClientMessage:
+      description: Сообщения клиент → сервер
+      oneOf:
+        - $ref: '#/components/schemas/WsAuth'
+        - $ref: '#/components/schemas/WsSubscribe'
+        - $ref: '#/components/schemas/WsUnsubscribe'
+        - $ref: '#/components/schemas/WsPing'
+      discriminator:
+        propertyName: type
+        mapping:
+          auth: '#/components/schemas/WsAuth'
+          subscribe: '#/components/schemas/WsSubscribe'
+          unsubscribe: '#/components/schemas/WsUnsubscribe'
+          ping: '#/components/schemas/WsPing'
+
+    WsAuth:
+      type: object
+      required: [type, token]
+      properties:
+        type:
+          type: string
+          const: auth
+        token:
+          type: string
+          description: Access-токен (тот же, что в REST)
+
+    WsSubscribe:
+      type: object
+      required: [type, subscriptionId, channel]
+      properties:
+        type:
+          type: string
+          const: subscribe
+        subscriptionId:
+          type: string
+          maxLength: 64
+          description: Идентификатор подписки, придумывает клиент. Повторный `subscribe` с тем же id заменяет подписку.
+        channel:
+          type: string
+          enum: [cluster, chart, incidents, action_runs]
+        params:
+          description: Обязателен для `chart`; для `action_runs` необязателен; для остальных каналов не передаётся
+          oneOf:
+            - $ref: '#/components/schemas/WsChartParams'
+            - $ref: '#/components/schemas/WsActionRunsParams'
+
+    WsChartParams:
+      type: object
+      required: [tableId, chartId, range]
+      properties:
+        tableId:
+          type: string
+          example: public.k8s_nodes
+        chartId:
+          type: string
+          description: '`id` из `TableDetails.charts`'
+          example: column:memory_utilization
+        range:
+          $ref: '#/components/schemas/ChartRange'
+        aggregation:
+          $ref: '#/components/schemas/Aggregation'
+
+    WsActionRunsParams:
+      type: object
+      additionalProperties: false
+      properties:
+        runId:
+          type: string
+          format: uuid
+          description: Следить за одним запуском. Без параметра — за всеми запусками в кластере.
+
+    WsUnsubscribe:
+      type: object
+      required: [type, subscriptionId]
+      properties:
+        type:
+          type: string
+          const: unsubscribe
+        subscriptionId:
+          type: string
+
+    WsPing:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          const: ping
+
+    WsServerMessage:
+      description: Сообщения сервер → клиент
+      oneOf:
+        - $ref: '#/components/schemas/WsAuthOk'
+        - $ref: '#/components/schemas/WsSubscribed'
+        - $ref: '#/components/schemas/WsClusterSnapshot'
+        - $ref: '#/components/schemas/WsClusterUpdate'
+        - $ref: '#/components/schemas/WsChartSnapshot'
+        - $ref: '#/components/schemas/WsChartPoints'
+        - $ref: '#/components/schemas/WsIncidentEvent'
+        - $ref: '#/components/schemas/WsActionRunUpdate'
+        - $ref: '#/components/schemas/WsError'
+        - $ref: '#/components/schemas/WsPong'
+      discriminator:
+        propertyName: type
+        mapping:
+          auth.ok: '#/components/schemas/WsAuthOk'
+          subscribed: '#/components/schemas/WsSubscribed'
+          cluster.snapshot: '#/components/schemas/WsClusterSnapshot'
+          cluster.update: '#/components/schemas/WsClusterUpdate'
+          chart.snapshot: '#/components/schemas/WsChartSnapshot'
+          chart.points: '#/components/schemas/WsChartPoints'
+          incident.event: '#/components/schemas/WsIncidentEvent'
+          action_run.update: '#/components/schemas/WsActionRunUpdate'
+          error: '#/components/schemas/WsError'
+          pong: '#/components/schemas/WsPong'
+
+    WsAuthOk:
+      type: object
+      required: [type, user, serverTime]
+      properties:
+        type:
+          type: string
+          const: auth.ok
+        user:
+          type: object
+          required: [id, roles]
+          properties:
+            id:
+              type: string
+            roles:
+              type: array
+              items:
+                $ref: '#/components/schemas/Role'
+        serverTime:
+          type: integer
+          format: int64
+          description: Время сервера, мс — чтобы клиент учёл расхождение часов при отрисовке LIVE-графика
+
+    WsSubscribed:
+      type: object
+      required: [type, subscriptionId]
+      properties:
+        type:
+          type: string
+          const: subscribed
+        subscriptionId:
+          type: string
+
+    WsClusterSnapshot:
+      type: object
+      required: [type, subscriptionId, cluster]
+      properties:
+        type:
+          type: string
+          const: cluster.snapshot
+        subscriptionId:
+          type: string
+        cluster:
+          $ref: '#/components/schemas/ClusterOverview'
+
+    WsClusterUpdate:
+      type: object
+      description: Изменившиеся узлы. Узел приходит целиком; чего нет в `nodes` — не изменилось.
+      required: [type, subscriptionId, status, nodes, updatedAt]
+      properties:
+        type:
+          type: string
+          const: cluster.update
+        subscriptionId:
+          type: string
+        status:
+          type: string
+          enum: [healthy, degraded, critical, unknown]
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/NodeState'
+        removedNodeIds:
+          type: array
+          description: Узлы, исчезнувшие из топологии
+          items:
+            type: string
+        updatedAt:
+          type: string
+          format: date-time
+
+    WsChartSnapshot:
+      type: object
+      description: История графика за диапазон (агрегирована в БД) + линии порогов. Приходит после каждого `subscribe` на `chart`.
+      required: [type, subscriptionId, tableId, chartId, range, aggregation, stepMs, unit, from, to, points, thresholds]
+      properties:
+        type:
+          type: string
+          const: chart.snapshot
+        subscriptionId:
+          type: string
+        tableId:
+          type: string
+        chartId:
+          type: string
+        range:
+          $ref: '#/components/schemas/ChartRange'
+        aggregation:
+          $ref: '#/components/schemas/Aggregation'
+        stepMs:
+          type: integer
+          description: Шаг агрегации, мс
+        unit:
+          $ref: '#/components/schemas/Unit'
+        from:
+          type: integer
+          format: int64
+        to:
+          type: integer
+          format: int64
+        points:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChartPoint'
+        thresholds:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChartThresholdLine'
+
+    WsChartPoints:
+      type: object
+      description: |
+        Новые точки графика. Последняя точка может приходить повторно с тем же timestamp,
+        пока интервал не закрыт, — клиент заменяет её значение, а не добавляет новую.
+      required: [type, subscriptionId, points]
+      properties:
+        type:
+          type: string
+          const: chart.points
+        subscriptionId:
+          type: string
+        points:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChartPoint'
+
+    WsIncidentEvent:
+      type: object
+      required: [type, subscriptionId, event, incident]
+      properties:
+        type:
+          type: string
+          const: incident.event
+        subscriptionId:
+          type: string
+        event:
+          type: string
+          enum: [opened, acknowledged, resolved]
+        incident:
+          $ref: '#/components/schemas/Incident'
+
+    WsActionRunUpdate:
+      type: object
+      required: [type, subscriptionId, run]
+      properties:
+        type:
+          type: string
+          const: action_run.update
+        subscriptionId:
+          type: string
+        run:
+          $ref: '#/components/schemas/ActionRun'
+
+    WsError:
+      type: object
+      required: [type, code, message]
+      properties:
+        type:
+          type: string
+          const: error
+        subscriptionId:
+          type: [string, 'null']
+          description: Подписка, к которой относится ошибка; `null` — ошибка соединения
+        code:
+          type: string
+          enum: [bad_message, unknown_channel, table_not_found, chart_not_found, forbidden, subscription_limit, internal]
+        message:
+          type: string
+
+    WsPong:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          const: pong
